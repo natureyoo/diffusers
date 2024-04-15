@@ -15,8 +15,14 @@
 import inspect
 import warnings
 from typing import Any, Callable, Dict, List, Optional, Union
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import numpy as np
 
 import PIL.Image
+from PIL import ImageDraw
+from torchvision.transforms.functional import to_pil_image, pil_to_tensor
 import torch
 from transformers import (
     CLIPFeatureExtractor,
@@ -613,6 +619,8 @@ class StableDiffusionGLIGENTextImagePipeline(DiffusionPipeline, StableDiffusionM
         phrases, images = gligen_phrases, gligen_images
         images = [None] * len(phrases) if images is None else images
         phrases = [None] * len(images) if phrases is None else phrases
+        # images = [None]
+        # phrases = [None]
 
         boxes = torch.zeros(max_objs, 4, device=device, dtype=self.text_encoder.dtype)
         masks = torch.zeros(max_objs, device=device, dtype=self.text_encoder.dtype)
@@ -680,9 +688,7 @@ class StableDiffusionGLIGENTextImagePipeline(DiffusionPipeline, StableDiffusionM
 
         return out
 
-    @torch.no_grad()
-    @replace_example_docstring(EXAMPLE_DOC_STRING)
-    def __call__(
+    def generate_with_detector_guidance(
         self,
         prompt: Union[str, List[str]] = None,
         height: Optional[int] = None,
@@ -710,6 +716,16 @@ class StableDiffusionGLIGENTextImagePipeline(DiffusionPipeline, StableDiffusionM
         cross_attention_kwargs: Optional[Dict[str, Any]] = None,
         gligen_normalize_constant: float = 28.7,
         clip_skip: int = None,
+        vis_period: int = 0,
+        wandb = None,
+        file_name: str = "",
+        detector = None,
+        feats_bank = None,
+        compute_loss=None,
+        cls_idxes=None,
+        loss_type: str = "feature",
+        guidance_step: int = 300,
+        guidance_weight: float = 1.0,
     ):
         r"""
         The call function to the pipeline for generation.
@@ -798,6 +814,411 @@ class StableDiffusionGLIGENTextImagePipeline(DiffusionPipeline, StableDiffusionM
                 second element is a list of `bool`s indicating whether the corresponding generated image contains
                 "not-safe-for-work" (nsfw) content.
         """
+        # 0. Default height and width to unet
+        height = height or self.unet.config.sample_size * self.vae_scale_factor
+        width = width or self.unet.config.sample_size * self.vae_scale_factor
+
+        # 1. Check inputs. Raise error if not correct
+        self.check_inputs(
+            prompt,
+            height,
+            width,
+            callback_steps,
+            negative_prompt,
+            prompt_embeds,
+            negative_prompt_embeds,
+        )
+
+        # 2. Define call parameters
+        if prompt is not None and isinstance(prompt, str):
+            batch_size = 1
+        elif prompt is not None and isinstance(prompt, list):
+            batch_size = len(prompt)
+        else:
+            batch_size = prompt_embeds.shape[0]
+
+        device = self._execution_device
+        # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
+        # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
+        # corresponds to doing no classifier free guidance.
+        do_classifier_free_guidance = guidance_scale > 1.0
+
+        with torch.no_grad():
+            # 3. Encode input prompt
+            prompt_embeds, negative_prompt_embeds = self.encode_prompt(
+                prompt,
+                device,
+                num_images_per_prompt,
+                do_classifier_free_guidance,
+                negative_prompt,
+                prompt_embeds=prompt_embeds,
+                negative_prompt_embeds=negative_prompt_embeds,
+                clip_skip=clip_skip,
+            )
+
+            if do_classifier_free_guidance:
+                prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds])
+
+            # 4. Prepare timesteps
+            self.scheduler.set_timesteps(num_inference_steps, device=device)
+            timesteps = self.scheduler.timesteps
+
+            # 5. Prepare latent variables
+            num_channels_latents = self.unet.in_channels
+            latents = self.prepare_latents(
+                batch_size * num_images_per_prompt,
+                num_channels_latents,
+                height,
+                width,
+                prompt_embeds.dtype,
+                device,
+                generator,
+                latents,
+            )
+
+            # 5.1 Prepare GLIGEN variables
+            max_objs = 30
+            if len(gligen_boxes) > max_objs:
+                warnings.warn(
+                    f"More that {max_objs} objects found. Only first {max_objs} objects will be processed.",
+                    FutureWarning,
+                )
+                gligen_phrases = gligen_phrases[:max_objs]
+                gligen_boxes = gligen_boxes[:max_objs]
+                gligen_images = gligen_images[:max_objs]
+
+            repeat_batch = batch_size * num_images_per_prompt
+
+            if do_classifier_free_guidance:
+                repeat_batch = repeat_batch * 2
+
+            if cross_attention_kwargs is None:
+                cross_attention_kwargs = {}
+
+            hidden_size = prompt_embeds.shape[2]
+
+            cross_attention_kwargs["gligen"] = self.get_cross_attention_kwargs_with_grounded(
+                hidden_size=hidden_size,
+                gligen_phrases=gligen_phrases,
+                gligen_images=gligen_images,
+                gligen_boxes=gligen_boxes,
+                input_phrases_mask=input_phrases_mask,
+                input_images_mask=input_images_mask,
+                repeat_batch=repeat_batch,
+                normalize_constant=gligen_normalize_constant,
+                max_objs=max_objs,
+                device=device,
+            )
+
+            cross_attention_kwargs_without_grounded = {}
+            cross_attention_kwargs_without_grounded["gligen"] = self.get_cross_attention_kwargs_without_grounded(
+                hidden_size=hidden_size, repeat_batch=repeat_batch, max_objs=max_objs, device=device
+            )
+
+            # Prepare latent variables for GLIGEN inpainting
+            if gligen_inpaint_image is not None:
+                # if the given input image is not of the same size as expected by VAE
+                # center crop and resize the input image to expected shape
+                if gligen_inpaint_image.size != (self.vae.sample_size, self.vae.sample_size):
+                    gligen_inpaint_image = self.target_size_center_crop(gligen_inpaint_image, self.vae.sample_size)
+                # Convert a single image into a batch of images with a batch size of 1
+                # The resulting shape becomes (1, C, H, W), where C is the number of channels,
+                # and H and W are the height and width of the image.
+                # scales the pixel values to a range [-1, 1]
+                gligen_inpaint_image = self.image_processor.preprocess(gligen_inpaint_image)
+                gligen_inpaint_image = gligen_inpaint_image.to(dtype=self.vae.dtype, device=self.vae.device)
+                # Run AutoEncoder to get corresponding latents
+                gligen_inpaint_latent = self.vae.encode(gligen_inpaint_image).latent_dist.sample()
+                gligen_inpaint_latent = self.vae.config.scaling_factor * gligen_inpaint_latent
+                # Generate an inpainting mask
+                # pixel value = 0, where the object is present (defined by bounding boxes above)
+                #               1, everywhere else
+                gligen_inpaint_mask = self.draw_inpaint_mask_from_boxes(gligen_boxes, gligen_inpaint_latent.shape[2:])
+                gligen_inpaint_mask = gligen_inpaint_mask.to(
+                    dtype=gligen_inpaint_latent.dtype, device=gligen_inpaint_latent.device
+                )
+                gligen_inpaint_mask = gligen_inpaint_mask[None, None]
+                gligen_inpaint_mask_addition = torch.cat(
+                    (gligen_inpaint_latent * gligen_inpaint_mask, gligen_inpaint_mask), dim=1
+                )
+                # Convert a single mask into a batch of masks with a batch size of 1
+                gligen_inpaint_mask_addition = gligen_inpaint_mask_addition.expand(repeat_batch, -1, -1, -1).clone()
+
+            int(gligen_scheduled_sampling_beta * len(timesteps))
+            self.enable_fuser(True)
+
+            # 6. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
+            extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
+
+        scale_vals = {"latent": {"min": [], "max": [], "avg": []}, "noise": {"min": [], "max": [], "avg": []}, "guidance": {"min": [], "max": [], "avg": []}}
+        # 7. Denoising loop
+        num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
+        with self.progress_bar(total=num_inference_steps) as progress_bar:
+            for i, t in enumerate(timesteps):
+                with torch.no_grad():
+                    if latents.shape[1] != 4:
+                        latents = torch.randn_like(latents[:, :4])
+
+                    if gligen_inpaint_image is not None:
+                        gligen_inpaint_latent_with_noise = (
+                            self.scheduler.add_noise(
+                                gligen_inpaint_latent, torch.randn_like(gligen_inpaint_latent), torch.tensor([t])
+                            )
+                            .expand(latents.shape[0], -1, -1, -1)
+                            .clone()
+                        )
+                        latents = gligen_inpaint_latent_with_noise * gligen_inpaint_mask + latents * (
+                            1 - gligen_inpaint_mask
+                        )
+
+                    # expand the latents if we are doing classifier free guidance
+                    latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
+                    latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+
+                    if gligen_inpaint_image is not None:
+                        latent_model_input = torch.cat((latent_model_input, gligen_inpaint_mask_addition), dim=1)
+
+                    # predict the noise residual with grounded information
+                    noise_pred_with_grounding = self.unet(
+                        latent_model_input,
+                        t,
+                        encoder_hidden_states=prompt_embeds,
+                        cross_attention_kwargs=cross_attention_kwargs,
+                    ).sample
+
+                    # predict the noise residual without grounded information
+                    noise_pred_without_grounding = self.unet(
+                        latent_model_input,
+                        t,
+                        encoder_hidden_states=prompt_embeds,
+                        cross_attention_kwargs=cross_attention_kwargs_without_grounded,
+                    ).sample
+
+                    # perform guidance
+                    if do_classifier_free_guidance:
+                        # Using noise_pred_text from noise residual with grounded information and noise_pred_uncond from noise residual without grounded information
+                        _, noise_pred_text = noise_pred_with_grounding.chunk(2)
+                        noise_pred_uncond, _ = noise_pred_without_grounding.chunk(2)
+                        noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+                    else:
+                        noise_pred = noise_pred_with_grounding
+
+                if t < guidance_step:
+                    latents.requires_grad_(True)
+                    image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False)[0]
+                    image, has_nsfw_concept = self.run_safety_checker(image, device, prompt_embeds.dtype)
+                    if has_nsfw_concept is None:
+                        do_denormalize = [True] * image.shape[0]
+                    else:
+                        do_denormalize = [not has_nsfw for has_nsfw in has_nsfw_concept]
+                    # # visualize original denoised image
+                    # image_vis = self.image_processor.postprocess(image.detach(), output_type="pil",
+                    #                                          do_denormalize=do_denormalize)
+                    # wandb.log({"{}-original".format(file_name): [wandb.Image(image_vis[0], caption=f"Timestep {t}")]})
+
+                    image = self.image_processor.postprocess(image, output_type="pt", do_denormalize=do_denormalize)
+                    loss = compute_loss(detector, image, feats_bank[t.item()], gligen_phrases, gligen_boxes, cls_idxes, loss_type=loss_type)
+                    if loss > 0:
+                        loss.backward()
+                        noise_pred = noise_pred + guidance_weight * latents.grad * (1 - gligen_inpaint_mask)
+
+                # compute the previous noisy sample x_t -> x_t-1
+                latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
+                image = self.vae.decode(latents.detach() / self.vae.config.scaling_factor, return_dict=False)[0]
+                image, has_nsfw_concept = self.run_safety_checker(image, device, prompt_embeds.dtype)
+                if has_nsfw_concept is None:
+                    do_denormalize = [True] * image.shape[0]
+                else:
+                    do_denormalize = [not has_nsfw for has_nsfw in has_nsfw_concept]
+                # visualize guidance denoised image
+                image_vis = self.image_processor.postprocess(image.detach(), output_type="pil",
+                                                         do_denormalize=do_denormalize)
+                wandb.log({"{}-guidance".format(file_name): [wandb.Image(image_vis[0], caption=f"Timestep {t}")]})
+
+                # log latent and noise scale
+                for k, v in zip(["latent", "noise"], [latents, noise_pred]):
+                    norm_vals = torch.norm(v, dim=1)
+                    scale_vals[k]["min"].append(norm_vals.min().item())
+                    scale_vals[k]["max"].append(norm_vals.max().item())
+                    scale_vals[k]["avg"].append(norm_vals.mean().item())
+
+                    # call the callback, if provided
+                    if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
+                        progress_bar.update()
+                        if callback is not None and i % callback_steps == 0:
+                            step_idx = i // getattr(self.scheduler, "order", 1)
+                            callback(step_idx, t, latents)
+
+
+            # fig, ax = plt.subplots()
+            # x = np.arange(len(timesteps))
+            # # plot latent scale
+            # for k_name, color in zip(["latent", "noise", "guidance"], ["blue", "orangered", "green"]):
+            #     y = np.asarray(scale_vals[k_name]["avg"])
+            #     y_neg = np.asarray(scale_vals[k_name]["min"])
+            #     y_pos = np.asarray(scale_vals[k_name]["max"])
+            #     ax.errorbar(x, y, yerr=[y_neg, y_pos], fmt='o', ecolor=color, linestyle='-', color=color, label=k_name)
+            # ax.set_title('Scale Comparison')
+            # ax.set_xlabel('X-axis')
+            # ax.set_ylabel('Y-axis')
+            # ax.legend()
+            # wandb.log({"Scale Comparison {}".format(file_name): wandb.Image(fig)})
+            # plt.close(fig)
+        if not output_type == "latent":
+            image = self.vae.decode(latents.detach() / self.vae.config.scaling_factor, return_dict=False)[0]
+            image, has_nsfw_concept = self.run_safety_checker(image, device, prompt_embeds.dtype)
+        else:
+            image = latents
+            has_nsfw_concept = None
+            return image, has_nsfw_concept, gligen_inpaint_mask
+
+        if has_nsfw_concept is None:
+            do_denormalize = [True] * image.shape[0]
+        else:
+            do_denormalize = [not has_nsfw for has_nsfw in has_nsfw_concept]
+        with torch.no_grad():
+            image = self.image_processor.postprocess(image.detach(), output_type=output_type, do_denormalize=do_denormalize)
+
+        # Offload all models
+        self.maybe_free_model_hooks()
+
+        if not return_dict:
+            return (image, has_nsfw_concept)
+
+        return StableDiffusionPipelineOutput(images=image, nsfw_content_detected=has_nsfw_concept)
+
+    @torch.no_grad()
+    @replace_example_docstring(EXAMPLE_DOC_STRING)
+    def __call__(
+        self,
+        prompt: Union[str, List[str]] = None,
+        height: Optional[int] = None,
+        width: Optional[int] = None,
+        num_inference_steps: int = 50,
+        guidance_scale: float = 7.5,
+        gligen_scheduled_sampling_beta: float = 0.3,
+        gligen_phrases: List[str] = None,
+        gligen_images: List[PIL.Image.Image] = None,
+        input_phrases_mask: Union[int, List[int]] = None,
+        input_images_mask: Union[int, List[int]] = None,
+        gligen_boxes: List[List[float]] = None,
+        gligen_inpaint_image: Optional[PIL.Image.Image] = None,
+        negative_prompt: Optional[Union[str, List[str]]] = None,
+        num_images_per_prompt: Optional[int] = 1,
+        eta: float = 0.0,
+        generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
+        latents: Optional[torch.FloatTensor] = None,
+        prompt_embeds: Optional[torch.FloatTensor] = None,
+        negative_prompt_embeds: Optional[torch.FloatTensor] = None,
+        output_type: Optional[str] = "pil",
+        return_dict: bool = True,
+        callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
+        callback_steps: int = 1,
+        cross_attention_kwargs: Optional[Dict[str, Any]] = None,
+        gligen_normalize_constant: float = 28.7,
+        clip_skip: int = None,
+        vis_period: int = 0,
+        wandb = None,
+        file_name: str = "",
+        detector = None,
+        feats_bank = None,
+        compute_loss=None,
+        cls_idxes=None,
+        loss_type: str = "feature",
+    ):
+        r"""
+        The call function to the pipeline for generation.
+
+        Args:
+            prompt (`str` or `List[str]`, *optional*):
+                The prompt or prompts to guide image generation. If not defined, you need to pass `prompt_embeds`.
+            height (`int`, *optional*, defaults to `self.unet.config.sample_size * self.vae_scale_factor`):
+                The height in pixels of the generated image.
+            width (`int`, *optional*, defaults to `self.unet.config.sample_size * self.vae_scale_factor`):
+                The width in pixels of the generated image.
+            num_inference_steps (`int`, *optional*, defaults to 50):
+                The number of denoising steps. More denoising steps usually lead to a higher quality image at the
+                expense of slower inference.
+            guidance_scale (`float`, *optional*, defaults to 7.5):
+                A higher guidance scale value encourages the model to generate images closely linked to the text
+                `prompt` at the expense of lower image quality. Guidance scale is enabled when `guidance_scale > 1`.
+            gligen_phrases (`List[str]`):
+                The phrases to guide what to include in each of the regions defined by the corresponding
+                `gligen_boxes`. There should only be one phrase per bounding box.
+            gligen_images (`List[PIL.Image.Image]`):
+                The images to guide what to include in each of the regions defined by the corresponding `gligen_boxes`.
+                There should only be one image per bounding box
+            input_phrases_mask (`int` or `List[int]`):
+                pre phrases mask input defined by the correspongding `input_phrases_mask`
+            input_images_mask (`int` or `List[int]`):
+                pre images mask input defined by the correspongding `input_images_mask`
+            gligen_boxes (`List[List[float]]`):
+                The bounding boxes that identify rectangular regions of the image that are going to be filled with the
+                content described by the corresponding `gligen_phrases`. Each rectangular box is defined as a
+                `List[float]` of 4 elements `[xmin, ymin, xmax, ymax]` where each value is between [0,1].
+            gligen_inpaint_image (`PIL.Image.Image`, *optional*):
+                The input image, if provided, is inpainted with objects described by the `gligen_boxes` and
+                `gligen_phrases`. Otherwise, it is treated as a generation task on a blank input image.
+            gligen_scheduled_sampling_beta (`float`, defaults to 0.3):
+                Scheduled Sampling factor from [GLIGEN: Open-Set Grounded Text-to-Image
+                Generation](https://arxiv.org/pdf/2301.07093.pdf). Scheduled Sampling factor is only varied for
+                scheduled sampling during inference for improved quality and controllability.
+            negative_prompt (`str` or `List[str]`, *optional*):
+                The prompt or prompts to guide what to not include in image generation. If not defined, you need to
+                pass `negative_prompt_embeds` instead. Ignored when not using guidance (`guidance_scale < 1`).
+            num_images_per_prompt (`int`, *optional*, defaults to 1):
+                The number of images to generate per prompt.
+            eta (`float`, *optional*, defaults to 0.0):
+                Corresponds to parameter eta (η) from the [DDIM](https://arxiv.org/abs/2010.02502) paper. Only applies
+                to the [`~schedulers.DDIMScheduler`], and is ignored in other schedulers.
+            generator (`torch.Generator` or `List[torch.Generator]`, *optional*):
+                A [`torch.Generator`](https://pytorch.org/docs/stable/generated/torch.Generator.html) to make
+                generation deterministic.
+            latents (`torch.FloatTensor`, *optional*):
+                Pre-generated noisy latents sampled from a Gaussian distribution, to be used as inputs for image
+                generation. Can be used to tweak the same generation with different prompts. If not provided, a latents
+                tensor is generated by sampling using the supplied random `generator`.
+            prompt_embeds (`torch.FloatTensor`, *optional*):
+                Pre-generated text embeddings. Can be used to easily tweak text inputs (prompt weighting). If not
+                provided, text embeddings are generated from the `prompt` input argument.
+            negative_prompt_embeds (`torch.FloatTensor`, *optional*):
+                Pre-generated negative text embeddings. Can be used to easily tweak text inputs (prompt weighting). If
+                not provided, `negative_prompt_embeds` are generated from the `negative_prompt` input argument.
+            output_type (`str`, *optional*, defaults to `"pil"`):
+                The output format of the generated image. Choose between `PIL.Image` or `np.array`.
+            return_dict (`bool`, *optional*, defaults to `True`):
+                Whether or not to return a [`~pipelines.stable_diffusion.StableDiffusionPipelineOutput`] instead of a
+                plain tuple.
+            callback (`Callable`, *optional*):
+                A function that calls every `callback_steps` steps during inference. The function is called with the
+                following arguments: `callback(step: int, timestep: int, latents: torch.FloatTensor)`.
+            callback_steps (`int`, *optional*, defaults to 1):
+                The frequency at which the `callback` function is called. If not specified, the callback is called at
+                every step.
+            cross_attention_kwargs (`dict`, *optional*):
+                A kwargs dictionary that if specified is passed along to the [`AttentionProcessor`] as defined in
+                [`self.processor`](https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/attention_processor.py).
+            gligen_normalize_constant (`float`, *optional*, defaults to 28.7):
+                The normalize value of the image embedding.
+            clip_skip (`int`, *optional*):
+                Number of layers to be skipped from CLIP while computing the prompt embeddings. A value of 1 means that
+                the output of the pre-final layer will be used for computing the prompt embeddings.
+
+        Examples:
+
+        Returns:
+            [`~pipelines.stable_diffusion.StableDiffusionPipelineOutput`] or `tuple`:
+                If `return_dict` is `True`, [`~pipelines.stable_diffusion.StableDiffusionPipelineOutput`] is returned,
+                otherwise a `tuple` is returned where the first element is a list with the generated images and the
+                second element is a list of `bool`s indicating whether the corresponding generated image contains
+                "not-safe-for-work" (nsfw) content.
+        """
+        if detector is not None:
+            return self.generate_with_detector_guidance(prompt, height, width, num_inference_steps, guidance_scale, gligen_scheduled_sampling_beta, gligen_phrases,
+                                             gligen_images, input_phrases_mask, input_images_mask, gligen_boxes, gligen_inpaint_image, negative_prompt,
+                                             num_images_per_prompt, eta, generator, latents, prompt_embeds, negative_prompt_embeds, output_type, return_dict, callback, callback_steps,
+                                             cross_attention_kwargs, gligen_normalize_constant, clip_skip, vis_period, wandb, file_name,
+                                             detector, feats_bank, compute_loss, cls_idxes, loss_type)
         # 0. Default height and width to unet
         height = height or self.unet.config.sample_size * self.vae_scale_factor
         width = width or self.unet.config.sample_size * self.vae_scale_factor
@@ -994,12 +1415,24 @@ class StableDiffusionGLIGENTextImagePipeline(DiffusionPipeline, StableDiffusionM
                         step_idx = i // getattr(self.scheduler, "order", 1)
                         callback(step_idx, t, latents)
 
+                if vis_period > 0 and i % vis_period == 0:
+                    image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False)[0]
+                    image, has_nsfw_concept = self.run_safety_checker(image, device, prompt_embeds.dtype)
+                    if has_nsfw_concept is None:
+                        do_denormalize = [True] * image.shape[0]
+                    else:
+                        do_denormalize = [not has_nsfw for has_nsfw in has_nsfw_concept]
+                    image = self.image_processor.postprocess(image, output_type="pil",
+                                                             do_denormalize=do_denormalize)
+                    wandb.log({file_name: [wandb.Image(image[0], caption=f"Timestep {t}")]})
+
         if not output_type == "latent":
             image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False)[0]
             image, has_nsfw_concept = self.run_safety_checker(image, device, prompt_embeds.dtype)
         else:
             image = latents
             has_nsfw_concept = None
+            return image, has_nsfw_concept, gligen_inpaint_mask
 
         if has_nsfw_concept is None:
             do_denormalize = [True] * image.shape[0]
@@ -1015,3 +1448,167 @@ class StableDiffusionGLIGENTextImagePipeline(DiffusionPipeline, StableDiffusionM
             return (image, has_nsfw_concept)
 
         return StableDiffusionPipelineOutput(images=image, nsfw_content_detected=has_nsfw_concept)
+
+    @torch.no_grad()
+    def extract_noised_features(
+        self,
+        data_loader,
+        detector,
+        num_inference_steps: int = 50,
+        vis_period: int = 0,
+        wandb = None,
+    ):
+        r"""
+        The call function to the pipeline for generation.
+
+        Args:
+            prompt (`str` or `List[str]`, *optional*):
+                The prompt or prompts to guide image generation. If not defined, you need to pass `prompt_embeds`.
+            height (`int`, *optional*, defaults to `self.unet.config.sample_size * self.vae_scale_factor`):
+                The height in pixels of the generated image.
+            width (`int`, *optional*, defaults to `self.unet.config.sample_size * self.vae_scale_factor`):
+                The width in pixels of the generated image.
+            num_inference_steps (`int`, *optional*, defaults to 50):
+                The number of denoising steps. More denoising steps usually lead to a higher quality image at the
+                expense of slower inference.
+            guidance_scale (`float`, *optional*, defaults to 7.5):
+                A higher guidance scale value encourages the model to generate images closely linked to the text
+                `prompt` at the expense of lower image quality. Guidance scale is enabled when `guidance_scale > 1`.
+            gligen_phrases (`List[str]`):
+                The phrases to guide what to include in each of the regions defined by the corresponding
+                `gligen_boxes`. There should only be one phrase per bounding box.
+            gligen_images (`List[PIL.Image.Image]`):
+                The images to guide what to include in each of the regions defined by the corresponding `gligen_boxes`.
+                There should only be one image per bounding box
+            input_phrases_mask (`int` or `List[int]`):
+                pre phrases mask input defined by the correspongding `input_phrases_mask`
+            input_images_mask (`int` or `List[int]`):
+                pre images mask input defined by the correspongding `input_images_mask`
+            gligen_boxes (`List[List[float]]`):
+                The bounding boxes that identify rectangular regions of the image that are going to be filled with the
+                content described by the corresponding `gligen_phrases`. Each rectangular box is defined as a
+                `List[float]` of 4 elements `[xmin, ymin, xmax, ymax]` where each value is between [0,1].
+            gligen_inpaint_image (`PIL.Image.Image`, *optional*):
+                The input image, if provided, is inpainted with objects described by the `gligen_boxes` and
+                `gligen_phrases`. Otherwise, it is treated as a generation task on a blank input image.
+            gligen_scheduled_sampling_beta (`float`, defaults to 0.3):
+                Scheduled Sampling factor from [GLIGEN: Open-Set Grounded Text-to-Image
+                Generation](https://arxiv.org/pdf/2301.07093.pdf). Scheduled Sampling factor is only varied for
+                scheduled sampling during inference for improved quality and controllability.
+            negative_prompt (`str` or `List[str]`, *optional*):
+                The prompt or prompts to guide what to not include in image generation. If not defined, you need to
+                pass `negative_prompt_embeds` instead. Ignored when not using guidance (`guidance_scale < 1`).
+            num_images_per_prompt (`int`, *optional*, defaults to 1):
+                The number of images to generate per prompt.
+            eta (`float`, *optional*, defaults to 0.0):
+                Corresponds to parameter eta (η) from the [DDIM](https://arxiv.org/abs/2010.02502) paper. Only applies
+                to the [`~schedulers.DDIMScheduler`], and is ignored in other schedulers.
+            generator (`torch.Generator` or `List[torch.Generator]`, *optional*):
+                A [`torch.Generator`](https://pytorch.org/docs/stable/generated/torch.Generator.html) to make
+                generation deterministic.
+            latents (`torch.FloatTensor`, *optional*):
+                Pre-generated noisy latents sampled from a Gaussian distribution, to be used as inputs for image
+                generation. Can be used to tweak the same generation with different prompts. If not provided, a latents
+                tensor is generated by sampling using the supplied random `generator`.
+            prompt_embeds (`torch.FloatTensor`, *optional*):
+                Pre-generated text embeddings. Can be used to easily tweak text inputs (prompt weighting). If not
+                provided, text embeddings are generated from the `prompt` input argument.
+            negative_prompt_embeds (`torch.FloatTensor`, *optional*):
+                Pre-generated negative text embeddings. Can be used to easily tweak text inputs (prompt weighting). If
+                not provided, `negative_prompt_embeds` are generated from the `negative_prompt` input argument.
+            output_type (`str`, *optional*, defaults to `"pil"`):
+                The output format of the generated image. Choose between `PIL.Image` or `np.array`.
+            return_dict (`bool`, *optional*, defaults to `True`):
+                Whether or not to return a [`~pipelines.stable_diffusion.StableDiffusionPipelineOutput`] instead of a
+                plain tuple.
+            callback (`Callable`, *optional*):
+                A function that calls every `callback_steps` steps during inference. The function is called with the
+                following arguments: `callback(step: int, timestep: int, latents: torch.FloatTensor)`.
+            callback_steps (`int`, *optional*, defaults to 1):
+                The frequency at which the `callback` function is called. If not specified, the callback is called at
+                every step.
+            cross_attention_kwargs (`dict`, *optional*):
+                A kwargs dictionary that if specified is passed along to the [`AttentionProcessor`] as defined in
+                [`self.processor`](https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/attention_processor.py).
+            gligen_normalize_constant (`float`, *optional*, defaults to 28.7):
+                The normalize value of the image embedding.
+            clip_skip (`int`, *optional*):
+                Number of layers to be skipped from CLIP while computing the prompt embeddings. A value of 1 means that
+                the output of the pre-final layer will be used for computing the prompt embeddings.
+
+        Examples:
+
+        Returns:
+            [`~pipelines.stable_diffusion.StableDiffusionPipelineOutput`] or `tuple`:
+                If `return_dict` is `True`, [`~pipelines.stable_diffusion.StableDiffusionPipelineOutput`] is returned,
+                otherwise a `tuple` is returned where the first element is a list with the generated images and the
+                second element is a list of `bool`s indicating whether the corresponding generated image contains
+                "not-safe-for-work" (nsfw) content.
+        """
+        # 2. Define call parameters
+        batch_size = 2
+
+        device = self._execution_device
+
+        # 4. Prepare timesteps
+        self.scheduler.set_timesteps(num_inference_steps, device=device)
+        timesteps = self.scheduler.timesteps
+
+        feats_bank = {t.item(): {c: torch.Tensor([]).to(device) for c in range(8)} for t in timesteps}
+        for idx, inputs in enumerate(data_loader):
+            f_name = inputs[0]['image_id']
+            img1, img2 = inputs[0]['image'][:, :, :600], inputs[0]['image'][:, :, 600:]
+            img_list = []
+            for img_idx, img in enumerate([img1, img2]):
+                img = to_pil_image(img)
+                # Prepare latent variables for images
+                # if the given input image is not of the same size as expected by VAE
+                # center crop and resize the input image to expected shape
+                if img.size != (self.vae.sample_size, self.vae.sample_size):
+                    img = self.target_size_center_crop(img, self.vae.sample_size)
+                img = self.image_processor.preprocess(img)
+                img = img.to(dtype=self.vae.dtype, device=self.vae.device)
+                img_list.append(img)
+            img = torch.cat(img_list, dim=0)
+            # Convert a single image into a batch of images with a batch size of 1
+            # The resulting shape becomes (1, C, H, W), where C is the number of channels,
+            # and H and W are the height and width of the image.
+            # scales the pixel values to a range [-1, 1]
+
+            # Run AutoEncoder to get corresponding latents
+            latent = self.vae.encode(img).latent_dist.sample()
+            latent = self.vae.config.scaling_factor * latent
+
+            with self.progress_bar(total=num_inference_steps) as progress_bar:
+                for i, t in enumerate(timesteps):
+                    latent_with_noise = (
+                        self.scheduler.add_noise(
+                            latent, torch.randn_like(latent), torch.tensor([t])
+                        )
+                        .expand(batch_size, -1, -1, -1)
+                        .clone()
+                    )
+                    # decode noised latents
+                    image = self.vae.decode(latent_with_noise / self.vae.config.scaling_factor, return_dict=False)[0]
+                    do_denormalize = [True] * image.shape[0]
+                    image = torch.cat([image[0], image[1]], dim=-1).unsqueeze(0)[:, [2,1,0], :, :] # BGR -> RGB
+                    input_tensor = self.image_processor.postprocess(image, output_type="pt", do_denormalize=do_denormalize) * 255
+                    image = self.image_processor.postprocess(image, output_type="pil", do_denormalize=do_denormalize)[0]
+                    draw = ImageDraw.Draw(image)
+                    draw.rectangle((100, 100, 300, 300), outline=(0, 255, 0), width=3)
+
+                    box_features, predictions, gt_classes = detector.extract_features([{'image': input_tensor[0], 'instances': inputs[0]['instances']}])
+                    outputs = detector([{'image': input_tensor[0]}])
+
+                    for c in torch.unique(gt_classes):
+                        feats_bank[t.item()][c.item()] = torch.cat([feats_bank[t.item()][c.item()], box_features[gt_classes == c].mean(dim=[2,3])], dim=0)
+
+                    draw = ImageDraw.Draw(image)
+                    pred_boxes = outputs[0]['instances'].pred_boxes.tensor
+                    for b_idx in range(pred_boxes.shape[0]):
+                        box_coord = pred_boxes[b_idx].cpu().numpy()
+                        draw.rectangle((box_coord[0], box_coord[1], box_coord[2], box_coord[3]), outline=(0, 255, 0), width=3)
+
+                    wandb.log({f_name: [wandb.Image(image, caption=f"Timestep {t}")]})
+                    progress_bar.update()
+        return feats_bank

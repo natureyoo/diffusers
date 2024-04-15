@@ -123,6 +123,7 @@ class PNDMScheduler(SchedulerMixin, ConfigMixin):
         prediction_type: str = "epsilon",
         timestep_spacing: str = "leading",
         steps_offset: int = 0,
+        clip_sample: bool = False,
     ):
         if trained_betas is not None:
             self.betas = torch.tensor(trained_betas, dtype=torch.float32)

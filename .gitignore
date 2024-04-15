@@ -1,6 +1,11 @@
 # Initially taken from GitHub's Python gitignore file
 
 examples/jy/wandb/
+examples/jy/*.png
+examples/jy/*.jpg
+examples/jy/*.jpeg
+examples/jy/outputs/
+
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

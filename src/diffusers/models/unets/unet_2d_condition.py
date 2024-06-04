@@ -1139,7 +1139,10 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin,
 
         # 1. time
         t_emb = self.get_time_embed(sample=sample, timestep=timestep)
-        emb = self.time_embedding(t_emb, timestep_cond)
+        try:
+            emb = self.time_embedding(t_emb, timestep_cond)
+        except:
+            print('')
         aug_emb = None
 
         class_emb = self.get_class_embed(sample=sample, class_labels=class_labels)

@@ -14,6 +14,7 @@
 import inspect
 from importlib import import_module
 from typing import Callable, List, Optional, Union
+import math
 
 import torch
 import torch.nn.functional as F
@@ -1223,6 +1224,7 @@ class AttnProcessor2_0:
         encoder_hidden_states: Optional[torch.FloatTensor] = None,
         attention_mask: Optional[torch.FloatTensor] = None,
         temb: Optional[torch.FloatTensor] = None,
+        masks: List = None,
         *args,
         **kwargs,
     ) -> torch.FloatTensor:
@@ -1276,6 +1278,12 @@ class AttnProcessor2_0:
         hidden_states = F.scaled_dot_product_attention(
             query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
         )
+
+        # Compute attention scores manually
+        # if query.shape[-2] != key.shape[-2]:
+        #     attention_scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(query.size(-1))
+        #     attention_scores = F.softmax(attention_scores, dim=-1)
+        #     masks.append(attention_scores)
 
         hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
         hidden_states = hidden_states.to(query.dtype)

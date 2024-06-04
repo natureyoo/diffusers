@@ -1024,30 +1024,30 @@ class StableDiffusionGLIGENTextImagePipeline(DiffusionPipeline, StableDiffusionM
 
                 # compute the previous noisy sample x_t -> x_t-1
                 latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
-                image = self.vae.decode(latents.detach() / self.vae.config.scaling_factor, return_dict=False)[0]
-                image, has_nsfw_concept = self.run_safety_checker(image, device, prompt_embeds.dtype)
-                if has_nsfw_concept is None:
-                    do_denormalize = [True] * image.shape[0]
-                else:
-                    do_denormalize = [not has_nsfw for has_nsfw in has_nsfw_concept]
-                # visualize guidance denoised image
-                image_vis = self.image_processor.postprocess(image.detach(), output_type="pil",
-                                                         do_denormalize=do_denormalize)
-                wandb.log({"{}-guidance".format(file_name): [wandb.Image(image_vis[0], caption=f"Timestep {t}")]})
+                # image = self.vae.decode(latents.detach() / self.vae.config.scaling_factor, return_dict=False)[0]
+                # image, has_nsfw_concept = self.run_safety_checker(image, device, prompt_embeds.dtype)
+                # if has_nsfw_concept is None:
+                #     do_denormalize = [True] * image.shape[0]
+                # else:
+                #     do_denormalize = [not has_nsfw for has_nsfw in has_nsfw_concept]
+                # # visualize guidance denoised image
+                # image_vis = self.image_processor.postprocess(image.detach(), output_type="pil",
+                #                                          do_denormalize=do_denormalize)
+                # wandb.log({"{}-guidance".format(file_name): [wandb.Image(image_vis[0], caption=f"Timestep {t}")]})
+                #
+                # # log latent and noise scale
+                # for k, v in zip(["latent", "noise"], [latents, noise_pred]):
+                #     norm_vals = torch.norm(v, dim=1)
+                #     scale_vals[k]["min"].append(norm_vals.min().item())
+                #     scale_vals[k]["max"].append(norm_vals.max().item())
+                #     scale_vals[k]["avg"].append(norm_vals.mean().item())
 
-                # log latent and noise scale
-                for k, v in zip(["latent", "noise"], [latents, noise_pred]):
-                    norm_vals = torch.norm(v, dim=1)
-                    scale_vals[k]["min"].append(norm_vals.min().item())
-                    scale_vals[k]["max"].append(norm_vals.max().item())
-                    scale_vals[k]["avg"].append(norm_vals.mean().item())
-
-                    # call the callback, if provided
-                    if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
-                        progress_bar.update()
-                        if callback is not None and i % callback_steps == 0:
-                            step_idx = i // getattr(self.scheduler, "order", 1)
-                            callback(step_idx, t, latents)
+                # call the callback, if provided
+                if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
+                    progress_bar.update()
+                    if callback is not None and i % callback_steps == 0:
+                        step_idx = i // getattr(self.scheduler, "order", 1)
+                        callback(step_idx, t, latents)
 
 
             # fig, ax = plt.subplots()

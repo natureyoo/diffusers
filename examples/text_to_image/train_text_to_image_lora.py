@@ -26,6 +26,7 @@ from pathlib import Path
 
 import datasets
 import numpy as np
+from PIL import Image
 import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
@@ -560,14 +561,25 @@ def main():
             data_dir=args.train_data_dir,
         )
     else:
-        data_files = {}
+        # data_files = {}
         if args.train_data_dir is not None:
-            data_files["train"] = os.path.join(args.train_data_dir, "**")
-        dataset = load_dataset(
-            "imagefolder",
-            data_files=data_files,
-            cache_dir=args.cache_dir,
-        )
+            # data_files["train"] = os.path.join(args.train_data_dir, "**")
+            dataset = load_dataset('json', data_files = os.path.join(args.train_data_dir, "metadata.jsonl"))
+
+        def load_image(example):
+            # Open the image file
+            with Image.open(os.path.join(args.train_data_dir, example['file_name'])) as img:
+                # Convert the image data to a numpy array and return it
+                example['image'] = np.array(img)
+            return example
+
+        dataset = dataset.map(load_image)
+
+        # dataset = load_dataset(
+        #     "imagefolder",
+        #     data_files=data_files,
+        #     cache_dir=args.cache_dir,
+        # )
         # See more about loading custom images at
         # https://huggingface.co/docs/datasets/v2.4.0/en/image_load#imagefolder
 

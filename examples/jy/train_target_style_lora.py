@@ -54,7 +54,7 @@ from diffusers.utils.import_utils import is_xformers_available
 from diffusers.utils.torch_utils import is_compiled_module, randn_tensor
 from diffusers import StableDiffusionGLIGENPipeline
 
-from detectron2.data import MetadataCatalog, DatasetCatalog, get_detection_dataset_dicts
+# from detectron2.data import MetadataCatalog, DatasetCatalog, get_detection_dataset_dicts
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.26.0.dev0")
 
